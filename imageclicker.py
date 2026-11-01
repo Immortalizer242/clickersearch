@@ -1,5 +1,5 @@
-import io
 import json
+import random
 import threading
 import time
 import tkinter as tk
@@ -8,6 +8,7 @@ from tkinter import filedialog, messagebox
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import cv2
+import keyboard
 import mss
 import numpy as np
 import pyautogui
@@ -17,15 +18,22 @@ class ImageClicker:
     def __init__(self, root):
         self.root = root
         self.root.title("Multi-Image Match Clicker")
+        self.root.protocol("WM_DELETE_WINDOW", self.close_app)
 
-        # Each item is {"name": filename, "image": grayscale OpenCV image}
-        # The list order is the priority order.
+        # Images are checked in list order: top item has highest priority.
         self.templates = []
         self.running = False
 
         self.threshold = tk.DoubleVar(value=0.90)
         self.min_scale = tk.DoubleVar(value=0.50)
         self.max_scale = tk.DoubleVar(value=1.50)
+
+        # Random-key feature state
+        self.recorded_key = None
+        self.random_key_enabled = False
+        self.key_recording = False
+        self.recording_hook = None
+        self.key_loop_id = 0
 
         profile_buttons = tk.Frame(root)
         profile_buttons.pack(padx=12, pady=(10, 4), fill="x")
@@ -41,8 +49,7 @@ class ImageClicker:
         ).pack(side="left", padx=3)
 
         tk.Label(
-            root,
-            text="Image priority (top = highest):"
+            root, text="Image priority (top = highest):"
         ).pack(anchor="w", padx=12, pady=(8, 0))
 
         self.image_list = tk.Listbox(root, width=52, height=7)
@@ -52,13 +59,19 @@ class ImageClicker:
         priority_buttons.pack(padx=12, pady=2)
 
         tk.Button(
-            priority_buttons, text="Move up", command=lambda: self.move_item(-1)
+            priority_buttons,
+            text="Move up",
+            command=lambda: self.move_item(-1),
         ).pack(side="left", padx=3)
         tk.Button(
-            priority_buttons, text="Move down", command=lambda: self.move_item(1)
+            priority_buttons,
+            text="Move down",
+            command=lambda: self.move_item(1),
         ).pack(side="left", padx=3)
         tk.Button(
-            priority_buttons, text="Remove selected", command=self.remove_selected
+            priority_buttons,
+            text="Remove selected",
+            command=self.remove_selected,
         ).pack(side="left", padx=3)
 
         tk.Label(root, text="Match threshold (0–1):").pack()
@@ -87,7 +100,7 @@ class ImageClicker:
         self.status.pack(padx=12, pady=8)
 
         controls = tk.Frame(root)
-        controls.pack(pady=(0, 10))
+        controls.pack(pady=(0, 8))
 
         self.start_button = tk.Button(
             controls, text="Start", command=self.start
@@ -98,6 +111,24 @@ class ImageClicker:
             controls, text="Stop", command=self.stop, state="disabled"
         )
         self.stop_button.pack(side="left", padx=4)
+
+        key_controls = tk.Frame(root)
+        key_controls.pack(pady=(0, 4))
+
+        self.record_key_button = tk.Button(
+            key_controls, text="Record key", command=self.record_key
+        )
+        self.record_key_button.pack(side="left", padx=4)
+
+        self.toggle_key_button = tk.Button(
+            key_controls,
+            text="Random key: OFF",
+            command=self.toggle_random_key,
+        )
+        self.toggle_key_button.pack(side="left", padx=4)
+
+        self.key_status = tk.Label(root, text="No key recorded.")
+        self.key_status.pack(padx=12, pady=(0, 8))
 
         root.bind("<Escape>", lambda _event: self.stop())
 
@@ -160,7 +191,9 @@ class ImageClicker:
 
     def save_profile(self):
         if not self.templates:
-            messagebox.showwarning("No images", "Add images before saving a profile.")
+            messagebox.showwarning(
+                "No images", "Add images before saving a profile."
+            )
             return
 
         path = filedialog.asksaveasfilename(
@@ -182,7 +215,6 @@ class ImageClicker:
 
             with ZipFile(path, "w", compression=ZIP_DEFLATED) as archive:
                 for index, item in enumerate(self.templates):
-                    # Store each imported image inside the profile archive.
                     success, encoded = cv2.imencode(".png", item["image"])
                     if not success:
                         raise ValueError(f"Could not encode {item['name']}")
@@ -194,10 +226,7 @@ class ImageClicker:
                         "file": image_entry,
                     })
 
-                archive.writestr(
-                    "profile.json",
-                    json.dumps(profile, indent=2),
-                )
+                archive.writestr("profile.json", json.dumps(profile, indent=2))
 
             self.status.config(text=f"Profile saved: {Path(path).name}")
 
@@ -231,7 +260,6 @@ class ImageClicker:
                         "image": image,
                     })
 
-            # Replace the current list with the profile's saved priority order.
             self.templates = loaded_templates
             self.threshold.set(profile.get("threshold", 0.90))
             self.min_scale.set(profile.get("min_scale", 0.50))
@@ -243,11 +271,15 @@ class ImageClicker:
             )
 
         except Exception as error:
-            messagebox.showerror("Load failed", f"Could not load profile:\n{error}")
+            messagebox.showerror(
+                "Load failed", f"Could not load profile:\n{error}"
+            )
 
     def start(self):
         if not self.templates:
-            messagebox.showwarning("No images", "Add images or load a profile first.")
+            messagebox.showwarning(
+                "No images", "Add images or load a profile first."
+            )
             return
 
         try:
@@ -260,6 +292,9 @@ class ImageClicker:
                 "Invalid scale range",
                 "Enter positive numbers, with the maximum at least as large as the minimum.",
             )
+            return
+
+        if self.running:
             return
 
         self.running = True
@@ -277,74 +312,188 @@ class ImageClicker:
         low = float(self.min_scale.get())
         high = float(self.max_scale.get())
         scale_steps = np.linspace(low, high, num=11)
-
-        # Take a snapshot so list changes cannot alter the active scan.
         templates = list(self.templates)
         threshold = float(self.threshold.get())
 
-        with mss.mss() as screen:
-            monitor = screen.monitors[1]
+        try:
+            with mss.mss() as screen:
+                monitor = screen.monitors[1]
 
-            while self.running:
-                frame = np.array(screen.grab(monitor))
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
+                while self.running:
+                    frame = np.array(screen.grab(monitor))
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
 
-                # Check images in priority order. Click the first one that matches.
-                for item in templates:
-                    template = item["image"]
-                    original_h, original_w = template.shape
-                    found = None
-
-                    for scale in scale_steps:
-                        new_w = int(original_w * scale)
-                        new_h = int(original_h * scale)
-
-                        if (
-                            new_w < 1
-                            or new_h < 1
-                            or new_w > gray.shape[1]
-                            or new_h > gray.shape[0]
-                        ):
-                            continue
-
-                        resized = cv2.resize(
-                            template,
-                            (new_w, new_h),
-                            interpolation=(
-                                cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC
-                            ),
-                        )
-
-                        result = cv2.matchTemplate(
-                            gray, resized, cv2.TM_CCOEFF_NORMED
-                        )
-                        _min_val, max_val, _min_loc, max_loc = cv2.minMaxLoc(result)
-
-                        if max_val >= threshold:
-                            found = (max_val, max_loc, new_w, new_h)
+                    # Check images in priority order; click the first match.
+                    for item in templates:
+                        if not self.running:
                             break
 
-                    if found:
-                        confidence, location, match_w, match_h = found
-                        x = monitor["left"] + location[0] + match_w // 2
-                        y = monitor["top"] + location[1] + match_h // 2
+                        template = item["image"]
+                        original_h, original_w = template.shape
+                        found = None
 
-                        pyautogui.click(x, y)
-                        name = item["name"]
-                        self.root.after(
-                            0,
-                            lambda n=name, c=confidence: self.status.config(
-                                text=f"Clicked {n} (confidence {c:.2f})."
-                            ),
-                        )
-                        time.sleep(1)
-                        break
+                        for scale in scale_steps:
+                            new_w = int(original_w * scale)
+                            new_h = int(original_h * scale)
 
-                time.sleep(0.2)
+                            if (
+                                new_w < 1
+                                or new_h < 1
+                                or new_w > gray.shape[1]
+                                or new_h > gray.shape[0]
+                            ):
+                                continue
 
-        self.root.after(0, self.stop)
+                            resized = cv2.resize(
+                                template,
+                                (new_w, new_h),
+                                interpolation=(
+                                    cv2.INTER_AREA
+                                    if scale < 1
+                                    else cv2.INTER_CUBIC
+                                ),
+                            )
+
+                            result = cv2.matchTemplate(
+                                gray, resized, cv2.TM_CCOEFF_NORMED
+                            )
+                            _min_val, max_val, _min_loc, max_loc = (
+                                cv2.minMaxLoc(result)
+                            )
+
+                            if max_val >= threshold:
+                                found = (max_val, max_loc, new_w, new_h)
+                                break
+
+                        if found:
+                            confidence, location, match_w, match_h = found
+                            x = monitor["left"] + location[0] + match_w // 2
+                            y = monitor["top"] + location[1] + match_h // 2
+
+                            pyautogui.click(x, y)
+                            name = item["name"]
+                            self.root.after(
+                                0,
+                                lambda n=name, c=confidence:
+                                    self.status.config(
+                                        text=f"Clicked {n} "
+                                             f"(confidence {c:.2f})."
+                                    ),
+                            )
+                            time.sleep(1)
+                            break
+
+                    time.sleep(0.2)
+
+        except Exception as error:
+            self.root.after(
+                0,
+                lambda e=error: messagebox.showerror(
+                    "Screen scan error", str(e)
+                ),
+            )
+        finally:
+            self.running = False
+            self.root.after(0, self.reset_scan_buttons)
+
+    def reset_scan_buttons(self):
+        self.start_button.config(state="normal")
+        self.stop_button.config(state="disabled")
+
+    def record_key(self):
+        if self.key_recording:
+            return
+
+        self.key_recording = True
+        self.key_status.config(text="Press a key to record…")
+        self.record_key_button.config(state="disabled")
+
+        def on_key(event):
+            if event.event_type != keyboard.KEY_DOWN:
+                return
+
+            key_name = event.name
+            self.recorded_key = key_name
+            self.key_recording = False
+
+            if self.recording_hook is not None:
+                keyboard.unhook(self.recording_hook)
+                self.recording_hook = None
+
+            self.root.after(
+                0, lambda: self.key_status.config(text=f"Recorded key: {key_name}")
+            )
+            self.root.after(
+                0, lambda: self.record_key_button.config(state="normal")
+            )
+
+        try:
+            self.recording_hook = keyboard.hook(on_key)
+        except Exception as error:
+            self.key_recording = False
+            self.record_key_button.config(state="normal")
+            messagebox.showerror("Key recording failed", str(error))
+
+    def toggle_random_key(self):
+        if self.random_key_enabled:
+            self.random_key_enabled = False
+            self.toggle_key_button.config(text="Random key: OFF")
+            self.key_status.config(
+                text=f"Recorded key: {self.recorded_key} (random presses off)"
+            )
+            return
+
+        if not self.recorded_key:
+            messagebox.showwarning("No key recorded", "Record a key first.")
+            return
+
+        self.random_key_enabled = True
+        self.key_loop_id += 1
+        loop_id = self.key_loop_id
+        self.toggle_key_button.config(text="Random key: ON")
+        threading.Thread(
+            target=self.random_key_loop,
+            args=(loop_id,),
+            daemon=True,
+        ).start()
+
+    def random_key_loop(self, loop_id):
+        while self.random_key_enabled and loop_id == self.key_loop_id:
+            time.sleep(random.uniform(1, 6))
+            if self.random_key_enabled and loop_id == self.key_loop_id:
+                try:
+                    pyautogui.press(self.recorded_key)
+                except Exception as error:
+                    self.root.after(
+                        0,
+                        lambda e=error: messagebox.showerror(
+                            "Key press failed", str(e)
+                        ),
+                    )
+                    self.random_key_enabled = False
+                    self.root.after(
+                        0,
+                        lambda: self.toggle_key_button.config(
+                            text="Random key: OFF"
+                        ),
+                    )
+                    return
+
+    def close_app(self):
+        self.running = False
+        self.random_key_enabled = False
+
+        if self.recording_hook is not None:
+            try:
+                keyboard.unhook(self.recording_hook)
+            except Exception:
+                pass
+            self.recording_hook = None
+
+        self.root.destroy()
 
 
-root = tk.Tk()
-app = ImageClicker(root)
-root.mainloop()
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = ImageClicker(root)
+    root.mainloop()
