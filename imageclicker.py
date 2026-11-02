@@ -14,6 +14,9 @@ import numpy as np
 import pyautogui
 
 
+KEY_HOLD_SECONDS = 0.5
+
+
 class ImageClicker:
     def __init__(self, root):
         self.root = root
@@ -421,10 +424,14 @@ class ImageClicker:
                 self.recording_hook = None
 
             self.root.after(
-                0, lambda: self.key_status.config(text=f"Recorded key: {key_name}")
+                0,
+                lambda: self.key_status.config(
+                    text=f"Recorded key: {key_name}"
+                ),
             )
             self.root.after(
-                0, lambda: self.record_key_button.config(state="normal")
+                0,
+                lambda: self.record_key_button.config(state="normal"),
             )
 
         try:
@@ -437,6 +444,7 @@ class ImageClicker:
     def toggle_random_key(self):
         if self.random_key_enabled:
             self.random_key_enabled = False
+            self.key_loop_id += 1
             self.toggle_key_button.config(text="Random key: OFF")
             self.key_status.config(
                 text=f"Recorded key: {self.recorded_key} (random presses off)"
@@ -460,28 +468,51 @@ class ImageClicker:
     def random_key_loop(self, loop_id):
         while self.random_key_enabled and loop_id == self.key_loop_id:
             time.sleep(random.uniform(1, 6))
-            if self.random_key_enabled and loop_id == self.key_loop_id:
-                try:
-                    pyautogui.press(self.recorded_key)
-                except Exception as error:
-                    self.root.after(
-                        0,
-                        lambda e=error: messagebox.showerror(
-                            "Key press failed", str(e)
-                        ),
-                    )
-                    self.random_key_enabled = False
-                    self.root.after(
-                        0,
-                        lambda: self.toggle_key_button.config(
-                            text="Random key: OFF"
-                        ),
-                    )
-                    return
+
+            if not self.random_key_enabled or loop_id != self.key_loop_id:
+                return
+
+            key = self.recorded_key
+            key_is_down = False
+
+            try:
+                pyautogui.keyDown(key)
+                key_is_down = True
+                time.sleep(KEY_HOLD_SECONDS)
+
+            except Exception as error:
+                self.root.after(
+                    0,
+                    lambda e=error: messagebox.showerror(
+                        "Key press failed", str(e)
+                    ),
+                )
+                self.random_key_enabled = False
+                self.key_loop_id += 1
+                self.root.after(
+                    0,
+                    lambda: self.toggle_key_button.config(
+                        text="Random key: OFF"
+                    ),
+                )
+                return
+
+            finally:
+                if key_is_down:
+                    try:
+                        pyautogui.keyUp(key)
+                    except Exception as error:
+                        self.root.after(
+                            0,
+                            lambda e=error: messagebox.showerror(
+                                "Key release failed", str(e)
+                            ),
+                        )
 
     def close_app(self):
         self.running = False
         self.random_key_enabled = False
+        self.key_loop_id += 1
 
         if self.recording_hook is not None:
             try:
